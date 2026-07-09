@@ -108,24 +108,49 @@ contract exactly (paths, status codes, error codes, JSON field names).
 - **Fix:** Added `cache.invalidate_report(user.org_id)` alongside the existing
   availability-cache invalidation.
 
+## 12. `get_booking` missing owner check for members
+- **File/line:** `app/routers/bookings.py`, `get_booking` (was L157–164)
+- **Bug:** The query only filtered by `Room.org_id`; unlike `cancel_booking`,
+  it never checked `booking.user_id == user.id` for non-admin callers.
+- **Why wrong (rule 10):** Members may read and cancel only their own
+  bookings; another member's booking id must behave as `404
+  BOOKING_NOT_FOUND`. A member could read any booking in the org.
+- **Fix:** Added `if user.role != "admin" and booking.user_id != user.id: raise AppError(404, "BOOKING_NOT_FOUND", ...)`,
+  the same guard already present in `cancel_booking`.
+
+## 13. Availability cache not invalidated on cancellation
+- **File/line:** `app/routers/bookings.py`, `cancel_booking` (near L215–217)
+- **Bug:** Only `cache.invalidate_report(...)` was called after cancelling a
+  booking; nothing invalidated the room/day's cached availability.
+- **Why wrong (rule 13):** `GET /rooms/{id}/availability` must reflect the
+  current state immediately. A cancelled booking kept showing as a busy
+  interval in cached responses.
+- **Fix:** Added `cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())`
+  alongside the existing report-cache invalidation.
+
+## 14. Export cross-org data leak
+- **File/line:** `app/services/export.py`, `generate_export` (was L48–50)
+- **Bug:** When `include_all=true` **and** `room_id` was supplied, the code
+  called `fetch_bookings_raw(db, room_id)`, which loads every booking for that
+  room id with **no organization filter at all**.
+- **Why wrong (rule 9):** A user (including admins) may only ever act on data
+  belonging to their own organization; cross-org resource IDs must behave as
+  non-existent. An admin from org A could pass a room id belonging to org B
+  and export its bookings.
+- **Fix:** Changed that branch to call `_fetch_scoped(db, org_id, None, room_id)`
+  instead, which applies the existing `Room.org_id == org_id` filter.
+
 ---
 
 ## Additional bugs identified (not yet fixed)
-These were found but left for a later pass (higher risk / multi-line):
+These are Hard-tier and left for a later pass (concurrency/structural):
 
 - **Refund rounding + response↔RefundLog mismatch**: `services/refunds.py`
   truncates (`int(...)`) and `cancel_booking` uses banker's `round`; rule 6 wants
   half-cents rounded up and the response amount equal to the stored RefundLog
   amount.
-- **`get_booking` member visibility** (`bookings.py`): a member can read another
-  member's booking in the same org; the per-owner check present in
-  `cancel_booking` is missing here (rule 10).
-- **Stale caches**: booking create does not invalidate the usage-report cache and
-  cancel does not invalidate the availability cache (rules 12/13, "immediately").
 - **Refresh tokens not single-use** (`routers/auth.py` refresh): rotation returns
   new tokens but never invalidates the presented refresh token (rule 8).
-- **Export cross-org leak** (`services/export.py` `fetch_bookings_raw`):
-  `include_all` + `room_id` bypasses org scoping (rule 9).
 - **Concurrency (hard)**: no locking around the reference-code counter, in-memory
   stats, and rate-limit buckets (lost updates → duplicate reference codes, wrong
   stats, over-limit requests); conflict/quota checks and refund logging are not

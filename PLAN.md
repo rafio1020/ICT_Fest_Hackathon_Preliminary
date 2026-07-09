@@ -4,8 +4,8 @@ Full re-scan of `app/` against the business rules in `contest_overview.md` /
 `README.md`. Bugs below are grouped by difficulty tier (matching the contest's
 Easy 3 / Medium 5 / Hard 10 scoring) and each is checked off as solved or not.
 
-**Progress: 11 of 23 identified bugs fixed** (6 Easy, 5 Medium). Everything
-Hard-tier, plus a couple of Medium items, are still open.
+**Progress: 14 of 23 identified bugs fixed** (6 Easy, 8 Medium). All Easy and
+Medium items are now solved — only the Hard tier remains.
 
 ---
 
@@ -33,7 +33,7 @@ Hard-tier, plus a couple of Medium items, are still open.
   password) → 409; same username in a different org still succeeds; normal
   registration flow unaffected.
 
-## Medium (5/8 solved)
+## Medium (8/8 solved)
 
 - [x] **Back-to-back bookings wrongly rejected** — `app/routers/bookings.py::_has_conflict`
   Used `<=` instead of strict `<` in the overlap test. Fixed.
@@ -49,10 +49,13 @@ Hard-tier, plus a couple of Medium items, are still open.
   duration `>= 1`. Fixed → `if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS:`.
   Verified: zero- and negative-duration bookings → 400 `INVALID_BOOKING_WINDOW`;
   1h and 8h boundary bookings still succeed; 9h still rejected.
-- [ ] **`get_booking` missing owner check for members** — `app/routers/bookings.py::get_booking`
-  Only filters by `Room.org_id`; unlike `cancel_booking`, it never checks
-  `booking.user_id == user.id` for non-admins. A member can read another
+- [x] **`get_booking` missing owner check for members** — `app/routers/bookings.py::get_booking`
+  Only filtered by `Room.org_id`; unlike `cancel_booking`, it never checked
+  `booking.user_id == user.id` for non-admins, so a member could read another
   member's booking by id. Rule 10 requires `404 BOOKING_NOT_FOUND` in that case.
+  Fixed → added the same owner/admin guard used in `cancel_booking`. Verified:
+  a member gets 404 on another member's booking; the owner and an admin can
+  still view it.
 - [x] **Usage-report cache not invalidated on booking creation** — `app/routers/bookings.py::create_booking`
   Only `cache.invalidate_availability(...)` was called on create; nothing
   invalidated report cache entries for the org, so a cached `GET
@@ -61,15 +64,23 @@ Hard-tier, plus a couple of Medium items, are still open.
   alongside the availability invalidation. Verified: creating a booking
   immediately changes the room's `confirmed_bookings` count in a subsequent
   usage-report call.
-- [ ] **Availability cache not invalidated on cancellation** — `app/routers/bookings.py::cancel_booking`
-  Only `cache.invalidate_report(...)` is called on cancel; nothing invalidates
-  the room/day's cached availability, so a cancelled booking keeps showing as
-  busy. Violates rule 13.
-- [ ] **Export cross-org data leak** — `app/services/export.py::generate_export` / `fetch_bookings_raw`
-  When `include_all=true` **and** `room_id` is given, `fetch_bookings_raw` fetches
-  every booking for that room id with no org filter at all — an admin from org A
-  can export bookings from a room belonging to org B. Violates rule 9
-  (cross-org resource IDs must behave as non-existent).
+- [x] **Availability cache not invalidated on cancellation** — `app/routers/bookings.py::cancel_booking`
+  Only `cache.invalidate_report(...)` was called on cancel; nothing invalidated
+  the room/day's cached availability, so a cancelled booking kept showing as
+  busy. Violates rule 13. Fixed → added
+  `cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())`.
+  Verified: availability shows the booking busy before cancel, empty right after.
+- [x] **Export cross-org data leak** — `app/services/export.py::generate_export`
+  When `include_all=true` **and** `room_id` was given, the code called
+  `fetch_bookings_raw(db, room_id)`, which fetches every booking for that room
+  id with no org filter at all — an admin from org A could export bookings from
+  a room belonging to org B. Violates rule 9 (cross-org resource IDs must
+  behave as non-existent). Fixed → that branch now calls
+  `_fetch_scoped(db, org_id, None, room_id)` instead. Verified: an org-B admin
+  exporting org-A's `room_id` gets an empty CSV (header only); an org-A admin
+  exporting its own room via `include_all` still works. (`fetch_bookings_raw`
+  is now unused but left in place — removing it would be an unrelated cleanup,
+  not a bug fix.)
 
 ## Hard (0/9 solved)
 
@@ -130,16 +141,26 @@ Hard-tier, plus a couple of Medium items, are still open.
    the same org (even with a wrong password) → `409 USERNAME_TAKEN`; same
    username in a different org still succeeds; normal registration/login flow
    unaffected.
-4. No response shape / status-code / error-code changes vs the documented API
+4. Targeted script confirmed the min-duration fix: zero/negative-duration
+   bookings → 400; 1h/8h boundaries still work; 9h still rejected.
+5. Targeted script confirmed the remaining Medium fixes together: a member
+   gets 404 viewing another member's booking (owner/admin can still view it);
+   availability reflects a cancellation immediately; an export with
+   `include_all=true&room_id=<foreign>` returns no rows for a foreign org,
+   while an admin's own room export still works.
+6. No response shape / status-code / error-code changes vs the documented API
    contract were introduced by any fix.
 
 ## Suggested order for the remaining work
-1. Medium correctness items: min-duration validation, `get_booking` ownership
-   check, export org-scoping — each small, isolated, low risk.
-2. Medium cache-staleness items: invalidate report cache on create, invalidate
-   availability cache on cancel.
-3. Hard tier, roughly in order of risk/complexity: refund rounding
-   unification, refresh-token single-use, then the concurrency-locking cluster
-   (reference codes → stats → rate limiter → conflict/quota checks → cancel),
-   and finally the notifications deadlock (fix lock ordering to match in both
-   functions).
+All Easy and Medium items are solved. Only Hard tier remains, roughly in order
+of risk/complexity:
+1. Refund rounding unification (`services/refunds.py` vs `cancel_booking`) —
+   single shared, correctly-rounded calculation.
+2. Refresh-token single-use (`routers/auth.py::refresh`) — add a refresh-jti
+   revocation store mirroring the access-token one.
+3. Concurrency-locking cluster: reference codes → stats → rate limiter →
+   conflict/quota checks → cancel (duplicate-refund race) — each needs a lock
+   or equivalent atomicity guard around its read-modify-write.
+4. Notifications lock-ordering deadlock (`services/notifications.py`) — make
+   `notify_created`/`notify_cancelled` acquire `_email_lock`/`_audit_lock` in
+   the same order.
