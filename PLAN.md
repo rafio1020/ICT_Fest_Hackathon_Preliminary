@@ -138,7 +138,11 @@ too — see "Cross-check against a peer report" below.
   newly issued refresh token itself works exactly once and its own reuse also
   → 401 (chained rotation); logout/refresh revocation stores are independent,
   so an unrelated, still-valid access token from the original login remains
-  usable.
+  usable. **Re-audit follow-up:** the initial fix's separate check + revoke
+  steps left a concurrent window (8 simultaneous refreshes of one token →
+  2× 200, reproduced live). Replaced with an atomic `consume_refresh_token()`
+  (check-and-mark under a lock). Verified: 5 rounds of 8 simultaneous
+  refreshes → exactly 1× 200 / 7× 401 every round.
 - [x] **Reference-code counter race** — `app/services/reference.py::next_reference_code`
   Read-then-sleep-then-increment on a shared dict with no lock; concurrent
   requests could read the same `current` value and emit duplicate

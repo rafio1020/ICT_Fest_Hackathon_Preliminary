@@ -174,6 +174,16 @@ contract exactly (paths, status codes, error codes, JSON field names).
   (new pair B); replaying A → 401; token B → 200 (new pair C); replaying B →
   401; an unrelated access token issued at login remains valid throughout
   (access- and refresh-token revocation are independent).
+- **Follow-up (found on re-audit):** the first version of this fix checked the
+  revocation set and marked the token used as two separate steps, so two
+  *concurrent* refreshes with the same token could both pass the check before
+  either revoked it — reproduced live (8 simultaneous refreshes → 2× 200).
+  Rule 8's single-use guarantee must hold under concurrency like every other
+  concurrent rule. Replaced the check + revoke pair with one atomic
+  `consume_refresh_token()` (check-and-mark under a `threading.Lock`; exactly
+  one caller can win). Verified: 5 rounds of 8 simultaneous refreshes with the
+  same token → exactly 1× 200 and 7× 401 every round; sequential rotation
+  behavior unchanged.
 
 ## 17. Reference-code counter race
 - **File/line:** `app/services/reference.py::next_reference_code`
