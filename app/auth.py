@@ -2,6 +2,7 @@
 import hashlib
 import hmac
 import os
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -24,8 +25,10 @@ from .models import User
 _revoked_tokens: set[str] = set()
 
 # Refresh tokens are single-use: once presented to /auth/refresh, their jti is
-# recorded here so the same refresh token cannot be replayed.
+# recorded here so the same refresh token cannot be replayed. The lock makes
+# the check-and-mark atomic so single-use holds under concurrent refreshes.
 _revoked_refresh_tokens: set[str] = set()
+_refresh_revocation_lock = threading.Lock()
 
 _PBKDF2_ROUNDS = 100_000
 
@@ -90,12 +93,18 @@ def revoke_access_token(payload: dict) -> None:
     _revoked_tokens.add(payload["jti"])
 
 
-def revoke_refresh_token(payload: dict) -> None:
-    _revoked_refresh_tokens.add(payload["jti"])
+def consume_refresh_token(payload: dict) -> bool:
+    """Atomically mark a refresh token as used.
 
-
-def is_refresh_token_revoked(payload: dict) -> bool:
-    return payload.get("jti") in _revoked_refresh_tokens
+    Returns False if the token was already used, True if this call consumed
+    it. The lock ensures exactly one concurrent caller can win.
+    """
+    with _refresh_revocation_lock:
+        jti = payload.get("jti")
+        if jti in _revoked_refresh_tokens:
+            return False
+        _revoked_refresh_tokens.add(jti)
+        return True
 
 
 def get_token_payload(request: Request) -> dict:
