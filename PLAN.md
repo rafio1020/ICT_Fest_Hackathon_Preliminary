@@ -4,8 +4,8 @@ Full re-scan of `app/` against the business rules in `contest_overview.md` /
 `README.md`. Bugs below are grouped by difficulty tier (matching the contest's
 Easy 3 / Medium 5 / Hard 10 scoring) and each is checked off as solved or not.
 
-**Progress: 21 of 23 identified bugs fixed** (6 Easy, 8 Medium, 7 Hard). All
-Easy and Medium items are solved; only the notifications deadlock remains.
+**Progress: 23 of 23 identified bugs fixed** (6 Easy, 8 Medium, 9 Hard). All
+identified bugs are solved.
 
 ---
 
@@ -82,7 +82,7 @@ Easy and Medium items are solved; only the notifications deadlock remains.
   is now unused but left in place — removing it would be an unrelated cleanup,
   not a bug fix.)
 
-## Hard (7/9 solved)
+## Hard (9/9 solved)
 
 - [x] **Refund rounding was wrong and inconsistent between two code paths** — `app/services/refunds.py::log_refund` vs `app/routers/bookings.py::cancel_booking`
   `log_refund` truncated (`int(refund_dollars * 100)`, always rounded down);
@@ -167,12 +167,18 @@ Easy and Medium items are solved; only the notifications deadlock remains.
   same booking → exactly 1 succeeds (`200`), the other 4 get `409
   ALREADY_CANCELLED`, and the booking ends up with exactly one `RefundLog`
   entry.
-- [ ] **Lock-ordering deadlock** — `app/services/notifications.py`
-  `notify_created` acquires `_email_lock` then `_audit_lock`; `notify_cancelled`
-  acquires `_audit_lock` then `_email_lock` — the opposite order. A concurrent
-  create + cancel can deadlock and hang the request threads indefinitely,
+- [x] **Lock-ordering deadlock** — `app/services/notifications.py`
+  `notify_created` acquired `_email_lock` then `_audit_lock`; `notify_cancelled`
+  acquired `_audit_lock` then `_email_lock` — the opposite order. A concurrent
+  create + cancel could deadlock and hang the request threads indefinitely,
   violating rule 16 ("no combination of concurrent valid requests may hang the
-  service").
+  service"). Fixed → rewrote `notify_cancelled` to acquire the locks in the
+  same order as `notify_created` (`_email_lock` outer, `_audit_lock` inner),
+  while preserving the original side-effect order (audit write still happens
+  before the email send). Verified: 20 mixed concurrent create+cancel
+  requests (10 creates, 10 cancels of pre-existing bookings by their owners)
+  all completed within ~5s with a hard 15s join timeout — no thread hung —
+  and all 20 requests succeeded with the expected status codes.
 
 ---
 
@@ -207,10 +213,15 @@ Easy and Medium items are solved; only the notifications deadlock remains.
 7. No response shape / status-code / error-code changes vs the documented API
    contract were introduced by any fix.
 
-## Suggested order for the remaining work
-All Easy and Medium items are solved; refund rounding, refresh-token
-single-use, and the full concurrency-locking cluster (Hard #1–7) are solved.
-Only the notifications deadlock remains:
-1. Notifications lock-ordering deadlock (`services/notifications.py`) — make
-   `notify_created`/`notify_cancelled` acquire `_email_lock`/`_audit_lock` in
-   the same order.
+## Status
+All 23 identified bugs are fixed and verified. No remaining work from this
+inventory. Recommended final steps before submission:
+1. Re-run `pytest` and the full concurrency/deadlock verification scripts one
+   more time against a clean checkout.
+2. Spin up the app via `docker compose up --build` (the real grading path) and
+   smoke-test a few endpoints manually, since local verification here ran
+   against a Python 3.13 venv with newer dependency versions (only
+   `requirements.txt`'s pinned 3.11-targeted versions ship in the container —
+   `requirements.txt` itself was never modified).
+3. Review `git diff` once more to confirm no unrelated/refactor changes crept
+   in, then commit.

@@ -240,14 +240,26 @@ contract exactly (paths, status codes, error codes, JSON field names).
   exactly 1 succeeds (`200`), 4 get `409 ALREADY_CANCELLED`, and the booking
   ends up with exactly one `RefundLog` entry.
 
+## 22. Notifications lock-ordering deadlock
+- **File/line:** `app/services/notifications.py::notify_created` /
+  `notify_cancelled`
+- **Bug:** `notify_created` acquired `_email_lock` then `_audit_lock`;
+  `notify_cancelled` acquired `_audit_lock` then `_email_lock` — the opposite
+  order. A concurrent create + cancel could deadlock (thread A holds
+  `_email_lock`, waits for `_audit_lock`; thread B holds `_audit_lock`, waits
+  for `_email_lock` — neither can proceed), hanging both request threads
+  indefinitely.
+- **Why wrong (rule 16):** The service must respond to all endpoints at all
+  times; no combination of concurrent valid requests may hang it.
+- **Fix:** Rewrote `notify_cancelled` to acquire the locks in the same order
+  as `notify_created` (`_email_lock` outer, `_audit_lock` inner), while
+  preserving the original relative order of the side effects themselves
+  (audit write still happens before the email send). Verified: 20 mixed
+  concurrent create+cancel requests (10 creates, 10 cancels of pre-existing
+  bookings by their owners) all completed within ~5s under a hard 15s join
+  timeout — no thread hung — with all 20 requests succeeding.
+
 ---
 
-## Additional bugs identified (not yet fixed)
-This is Hard-tier and left for a later pass:
-
-- **Notifications lock-ordering deadlock** (`services/notifications.py`):
-  `notify_created` acquires `_email_lock` then `_audit_lock`;
-  `notify_cancelled` acquires `_audit_lock` then `_email_lock` — the opposite
-  order. A concurrent create + cancel can deadlock and hang the request
-  threads indefinitely (rule 16, "no combination of concurrent valid requests
-  may hang the service").
+All 23 identified bugs (6 Easy, 8 Medium, 9 Hard) have now been fixed and
+verified. No bugs remain outstanding from this inventory.
