@@ -88,14 +88,31 @@ contract exactly (paths, status codes, error codes, JSON field names).
   password check.
 - **Fix:** `raise AppError(409, "USERNAME_TAKEN", "Username already taken in this organization")`.
 
+## 10. No minimum-duration / non-positive-duration validation
+- **File/line:** `app/routers/bookings.py`, `create_booking` (was L93–94)
+- **Bug:** Only `duration_hours > MAX_DURATION_HOURS` was checked. A
+  zero-duration (`start == end`) or negative-duration (`end < start`) booking
+  passed the "whole number of hours" check and was never rejected, producing a
+  booking with `price_cents <= 0`.
+- **Why wrong (rule 2):** `end_time` must be strictly after `start_time`, and
+  duration must be a whole number of hours, minimum 1.
+- **Fix:** `if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS: raise AppError(400, "INVALID_BOOKING_WINDOW", ...)`.
+
+## 11. Usage-report cache not invalidated on booking creation
+- **File/line:** `app/routers/bookings.py`, `create_booking` (near L120–122)
+- **Bug:** Only `cache.invalidate_availability(...)` was called after creating
+  a booking; nothing invalidated the org's cached usage-report entries.
+- **Why wrong (rule 12):** `GET /admin/usage-report` must reflect the current
+  state immediately. A cached report kept showing stale `confirmed_bookings`
+  / `revenue_cents` after a new booking was made.
+- **Fix:** Added `cache.invalidate_report(user.org_id)` alongside the existing
+  availability-cache invalidation.
+
 ---
 
 ## Additional bugs identified (not yet fixed)
 These were found but left for a later pass (higher risk / multi-line):
 
-- **Min-duration / `end ≤ start` not enforced** (`bookings.py` create_booking):
-  only `duration > MAX` is checked; durations `< 1h`, `0`, or negative slip
-  through (rule 2).
 - **Refund rounding + response↔RefundLog mismatch**: `services/refunds.py`
   truncates (`int(...)`) and `cancel_booking` uses banker's `round`; rule 6 wants
   half-cents rounded up and the response amount equal to the stored RefundLog
