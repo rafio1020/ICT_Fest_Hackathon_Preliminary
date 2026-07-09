@@ -77,6 +77,37 @@ contract exactly (paths, status codes, error codes, JSON field names).
   window of any size.
 - **Fix:** `if start <= now`.
 
+## 9. Duplicate username silently returned instead of `409 USERNAME_TAKEN`
+- **File/line:** `app/routers/auth.py`, `register` (was L37–43)
+- **Bug:** When a username already existed in the org, the handler returned
+  that existing user's `{user_id, org_id, username, role}` with `201`, without
+  checking the submitted password at all.
+- **Why wrong (rule 15):** A duplicate username within the org must return
+  `409 USERNAME_TAKEN`. The old behavior also leaked another user's
+  `user_id`/`role` to anyone who "registered" with their username, with no
+  password check.
+- **Fix:** `raise AppError(409, "USERNAME_TAKEN", "Username already taken in this organization")`.
+
+## 10. No minimum-duration / non-positive-duration validation
+- **File/line:** `app/routers/bookings.py`, `create_booking` (was L93–94)
+- **Bug:** Only `duration_hours > MAX_DURATION_HOURS` was checked. A
+  zero-duration (`start == end`) or negative-duration (`end < start`) booking
+  passed the "whole number of hours" check and was never rejected, producing a
+  booking with `price_cents <= 0`.
+- **Why wrong (rule 2):** `end_time` must be strictly after `start_time`, and
+  duration must be a whole number of hours, minimum 1.
+- **Fix:** `if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS: raise AppError(400, "INVALID_BOOKING_WINDOW", ...)`.
+
+## 11. Usage-report cache not invalidated on booking creation
+- **File/line:** `app/routers/bookings.py`, `create_booking` (near L120–122)
+- **Bug:** Only `cache.invalidate_availability(...)` was called after creating
+  a booking; nothing invalidated the org's cached usage-report entries.
+- **Why wrong (rule 12):** `GET /admin/usage-report` must reflect the current
+  state immediately. A cached report kept showing stale `confirmed_bookings`
+  / `revenue_cents` after a new booking was made.
+- **Fix:** Added `cache.invalidate_report(user.org_id)` alongside the existing
+  availability-cache invalidation.
+
 ---
 
 ## 9. Duplicate username silently logged the caller in instead of 409
@@ -91,6 +122,7 @@ contract exactly (paths, status codes, error codes, JSON field names).
   instead of returning the existing user. (Found during manual verification;
   not on the original difficulty-tier list.)
 
+<<<<<<< HEAD
 ## 10. Minimum duration / `end ≤ start` not enforced
 - **File/line:** `app/routers/bookings.py`, `create_booking` (~L98–100)
 - **Bug:** Only `duration_hours > MAX_DURATION_HOURS` was checked;
@@ -195,3 +227,25 @@ contract exactly (paths, status codes, error codes, JSON field names).
   the status check). Reordered `notify_cancelled` to acquire `_email_lock`
   before `_audit_lock`, matching `notify_created`, eliminating the
   lock-ordering deadlock.
+=======
+- **Refund rounding + response↔RefundLog mismatch**: `services/refunds.py`
+  truncates (`int(...)`) and `cancel_booking` uses banker's `round`; rule 6 wants
+  half-cents rounded up and the response amount equal to the stored RefundLog
+  amount.
+- **`get_booking` member visibility** (`bookings.py`): a member can read another
+  member's booking in the same org; the per-owner check present in
+  `cancel_booking` is missing here (rule 10).
+- **Stale caches**: booking create does not invalidate the usage-report cache and
+  cancel does not invalidate the availability cache (rules 12/13, "immediately").
+- **Refresh tokens not single-use** (`routers/auth.py` refresh): rotation returns
+  new tokens but never invalidates the presented refresh token (rule 8).
+- **Export cross-org leak** (`services/export.py` `fetch_bookings_raw`):
+  `include_all` + `room_id` bypasses org scoping (rule 9).
+- **Concurrency (hard)**: no locking around the reference-code counter, in-memory
+  stats, and rate-limit buckets (lost updates → duplicate reference codes, wrong
+  stats, over-limit requests); conflict/quota checks and refund logging are not
+  atomic under concurrent requests; and `services/notifications.py` acquires
+  `_email_lock`/`_audit_lock` in opposite orders in `notify_created` vs
+  `notify_cancelled`, a lock-ordering **deadlock** that can hang the service
+  (rules 3/4/5/6/7/14/16). Artificial `time.sleep()` calls widen these windows.
+>>>>>>> 0eb61791dc382d53d9a8fdb5353fc45cd80cebb2
