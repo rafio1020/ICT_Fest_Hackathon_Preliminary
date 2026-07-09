@@ -4,8 +4,8 @@ Full re-scan of `app/` against the business rules in `contest_overview.md` /
 `README.md`. Bugs below are grouped by difficulty tier (matching the contest's
 Easy 3 / Medium 5 / Hard 10 scoring) and each is checked off as solved or not.
 
-**Progress: 9 of 23 identified bugs fixed** (6 Easy, 3 Medium). Everything
-Hard-tier, plus a handful of Medium items, are still open.
+**Progress: 11 of 23 identified bugs fixed** (6 Easy, 5 Medium). Everything
+Hard-tier, plus a couple of Medium items, are still open.
 
 ---
 
@@ -33,7 +33,7 @@ Hard-tier, plus a handful of Medium items, are still open.
   password) → 409; same username in a different org still succeeds; normal
   registration flow unaffected.
 
-## Medium (3/8 solved)
+## Medium (5/8 solved)
 
 - [x] **Back-to-back bookings wrongly rejected** — `app/routers/bookings.py::_has_conflict`
   Used `<=` instead of strict `<` in the overlap test. Fixed.
@@ -41,21 +41,26 @@ Hard-tier, plus a handful of Medium items, are still open.
   `<24h` gave 50% instead of 0%; exactly-48h fell into the 50% bucket. Fixed.
 - [x] **UTC-offset input not converted** — `app/timeutils.py::parse_input_datetime`
   Dropped the offset instead of converting to UTC. Fixed → `astimezone(utc)`.
-- [ ] **No minimum-duration / non-positive-duration validation** — `app/routers/bookings.py::create_booking` (~L89–94)
-  Only `duration_hours > MAX_DURATION_HOURS` is checked. A zero-duration
-  (`start == end`) or negative-duration (`end < start`) booking passes the
-  "whole number of hours" check and is never rejected, producing a booking with
+- [x] **No minimum-duration / non-positive-duration validation** — `app/routers/bookings.py::create_booking`
+  Only `duration_hours > MAX_DURATION_HOURS` was checked. A zero-duration
+  (`start == end`) or negative-duration (`end < start`) booking passed the
+  "whole number of hours" check and was never rejected, producing a booking with
   `price_cents <= 0`. Rule 2 requires `end_time` strictly after `start_time` and
-  duration `>= 1`. Needs an added `duration_hours < MIN_DURATION_HOURS` check.
+  duration `>= 1`. Fixed → `if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS:`.
+  Verified: zero- and negative-duration bookings → 400 `INVALID_BOOKING_WINDOW`;
+  1h and 8h boundary bookings still succeed; 9h still rejected.
 - [ ] **`get_booking` missing owner check for members** — `app/routers/bookings.py::get_booking`
   Only filters by `Room.org_id`; unlike `cancel_booking`, it never checks
   `booking.user_id == user.id` for non-admins. A member can read another
   member's booking by id. Rule 10 requires `404 BOOKING_NOT_FOUND` in that case.
-- [ ] **Usage-report cache not invalidated on booking creation** — `app/routers/bookings.py::create_booking`
-  Only `cache.invalidate_availability(...)` is called on create; nothing
-  invalidates `cache` report entries for the org. A cached `GET
-  /admin/usage-report` will miss newly created bookings, violating rule 12
-  ("reflects the current state immediately").
+- [x] **Usage-report cache not invalidated on booking creation** — `app/routers/bookings.py::create_booking`
+  Only `cache.invalidate_availability(...)` was called on create; nothing
+  invalidated report cache entries for the org, so a cached `GET
+  /admin/usage-report` missed newly created bookings (rule 12, "reflects the
+  current state immediately"). Fixed → added `cache.invalidate_report(user.org_id)`
+  alongside the availability invalidation. Verified: creating a booking
+  immediately changes the room's `confirmed_bookings` count in a subsequent
+  usage-report call.
 - [ ] **Availability cache not invalidated on cancellation** — `app/routers/bookings.py::cancel_booking`
   Only `cache.invalidate_report(...)` is called on cancel; nothing invalidates
   the room/day's cached availability, so a cancelled booking keeps showing as
