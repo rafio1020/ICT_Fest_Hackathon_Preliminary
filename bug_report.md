@@ -1,0 +1,107 @@
+# Bug Report — CoWork Booking API
+
+Each bug below is a deviation from the business rules in the README / contest
+overview. Fixes are minimal (single-line where possible) and preserve the API
+contract exactly (paths, status codes, error codes, JSON field names).
+
+---
+
+## 1. Pagination broken three ways
+- **File/line:** `app/routers/bookings.py`, `list_bookings` (~L136–140)
+- **Bug:** The query used `order_by(Booking.start_time.desc(), ...)`,
+  `.offset(page * limit)`, and a hard-coded `.limit(10)`.
+- **Why wrong (rule 11):** Items must be sorted **ascending** by `start_time`,
+  page N must return items `[(N−1)·L, N·L)`, and `limit` must be honored. With
+  `offset(page*limit)` the first page skipped its own items; the descending order
+  and fixed limit further broke ordering and page sizes, causing skipped/repeated
+  items.
+- **Fix:** `.order_by(Booking.start_time.asc(), Booking.id.asc())`,
+  `.offset((page - 1) * limit)`, `.limit(limit)`.
+
+## 2. Booking detail overwrites `start_time` with `created_at`
+- **File/line:** `app/routers/bookings.py`, `get_booking` (was L166)
+- **Bug:** After serializing, the code did
+  `response["start_time"] = iso_utc(booking.created_at)`.
+- **Why wrong:** `GET /bookings/{id}` returned the creation timestamp in the
+  `start_time` field instead of the real booking start.
+- **Fix:** Removed that line; `serialize_booking` already sets the correct value.
+
+## 3. Access-token lifetime was 54000 seconds, not 900
+- **File/line:** `app/auth.py`, `create_access_token` (L50)
+- **Bug:** `timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES * 60)` with
+  `ACCESS_TOKEN_EXPIRE_MINUTES = 15` produced 900 **minutes**.
+- **Why wrong (rule 8):** Access tokens must satisfy `exp − iat == 900` seconds.
+- **Fix:** `timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)`.
+
+## 4. Logout never invalidated the token
+- **File/line:** `app/auth.py`, `get_token_payload` (L97)
+- **Bug:** `revoke_access_token` stores the token's `jti`, but the revocation
+  check was `if payload.get("sub") in _revoked_tokens` — it compared the user id
+  against a set of jtis.
+- **Why wrong (rule 8):** Logout must invalidate the presented access token
+  (subsequent use → 401). The mismatched key made logout a no-op.
+- **Fix:** `if payload.get("jti") in _revoked_tokens`.
+
+## 5. Back-to-back bookings wrongly rejected
+- **File/line:** `app/routers/bookings.py`, `_has_conflict` (L50)
+- **Bug:** Overlap test used `if b.start_time <= end and start <= b.end_time`.
+- **Why wrong (rule 3):** Two bookings overlap iff
+  `existing.start < new.end AND new.start < existing.end`; back-to-back bookings
+  (one ending exactly when the next starts) are allowed. The `<=` comparisons
+  flagged back-to-back bookings as `ROOM_CONFLICT`.
+- **Fix:** Strict `<` on both: `if b.start_time < end and start < b.end_time`.
+
+## 6. Cancellation refund tiers wrong
+- **File/line:** `app/routers/bookings.py`, `cancel_booking` (L200–205)
+- **Bug:** `if notice_hours > 48: 100 / elif notice >= 24h: 50 / else: 50`.
+- **Why wrong (rule 6):** Notice ≥ 48h → 100%, [24h, 48h) → 50%, **< 24h → 0%**.
+  The `else` branch returned 50% instead of 0%, and `> 48` (on an integer-hour
+  value) gave only 50% at exactly 48h instead of 100%.
+- **Fix:** `if notice >= timedelta(hours=48): 100 / elif notice >= timedelta(hours=24): 50 / else: 0`
+  (also removed the now-unused `notice_hours`).
+
+## 7. UTC-offset datetimes not converted to UTC
+- **File/line:** `app/timeutils.py`, `parse_input_datetime` (L13)
+- **Bug:** Offset-aware input was handled with `dt.replace(tzinfo=None)`, which
+  drops the offset **without converting**.
+- **Why wrong (rule 1):** Input carrying a UTC offset must be converted to UTC
+  before storage/comparison. `12:00+02:00` was stored as `12:00` instead of
+  `10:00`.
+- **Fix:** `dt = dt.astimezone(timezone.utc).replace(tzinfo=None)`.
+
+## 8. Five-minute grace window on past bookings
+- **File/line:** `app/routers/bookings.py`, `create_booking` (L86)
+- **Bug:** `if start <= now - timedelta(seconds=300)` allowed bookings up to 5
+  minutes in the past.
+- **Why wrong (rule 2):** `start_time` must be strictly in the future — no grace
+  window of any size.
+- **Fix:** `if start <= now`.
+
+---
+
+## Additional bugs identified (not yet fixed)
+These were found but left for a later pass (higher risk / multi-line):
+
+- **Min-duration / `end ≤ start` not enforced** (`bookings.py` create_booking):
+  only `duration > MAX` is checked; durations `< 1h`, `0`, or negative slip
+  through (rule 2).
+- **Refund rounding + response↔RefundLog mismatch**: `services/refunds.py`
+  truncates (`int(...)`) and `cancel_booking` uses banker's `round`; rule 6 wants
+  half-cents rounded up and the response amount equal to the stored RefundLog
+  amount.
+- **`get_booking` member visibility** (`bookings.py`): a member can read another
+  member's booking in the same org; the per-owner check present in
+  `cancel_booking` is missing here (rule 10).
+- **Stale caches**: booking create does not invalidate the usage-report cache and
+  cancel does not invalidate the availability cache (rules 12/13, "immediately").
+- **Refresh tokens not single-use** (`routers/auth.py` refresh): rotation returns
+  new tokens but never invalidates the presented refresh token (rule 8).
+- **Export cross-org leak** (`services/export.py` `fetch_bookings_raw`):
+  `include_all` + `room_id` bypasses org scoping (rule 9).
+- **Concurrency (hard)**: no locking around the reference-code counter, in-memory
+  stats, and rate-limit buckets (lost updates → duplicate reference codes, wrong
+  stats, over-limit requests); conflict/quota checks and refund logging are not
+  atomic under concurrent requests; and `services/notifications.py` acquires
+  `_email_lock`/`_audit_lock` in opposite orders in `notify_created` vs
+  `notify_cancelled`, a lock-ordering **deadlock** that can hang the service
+  (rules 3/4/5/6/7/14/16). Artificial `time.sleep()` calls widen these windows.
