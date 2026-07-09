@@ -175,15 +175,79 @@ contract exactly (paths, status codes, error codes, JSON field names).
   401; an unrelated access token issued at login remains valid throughout
   (access- and refresh-token revocation are independent).
 
+## 17. Reference-code counter race
+- **File/line:** `app/services/reference.py::next_reference_code`
+- **Bug:** Read-then-sleep-then-increment on a shared dict with no lock;
+  concurrent requests could read the same `current` value and emit duplicate
+  `reference_code`s.
+- **Why wrong (rule 7):** Every booking's `reference_code` must be unique,
+  including under concurrent creation.
+- **Fix:** Wrapped the read-increment body in a module-level `threading.Lock`
+  (single-process app, so a plain lock suffices). Verified: 6 concurrent
+  bookings on distinct slots all succeeded with 6 distinct reference codes.
+
+## 18. Stats service race
+- **File/line:** `app/services/stats.py::record_create` / `record_cancel`
+- **Bug:** Same read-sleep-write-without-lock pattern; concurrent
+  creates/cancels for the same room could lose updates.
+- **Why wrong (rule 14):** Room stats must always be consistent with the
+  bookings themselves, including after bursts of concurrent activity.
+- **Fix:** Wrapped both functions' bodies in a shared module-level
+  `threading.Lock`. Verified: 6 concurrent creates for the same room →
+  `total_confirmed_bookings == 6` and `total_revenue_cents` exactly
+  `6 × price_cents` (no lost updates).
+
+## 19. Rate limiter race
+- **File/line:** `app/services/ratelimit.py::record_and_check`
+- **Bug:** Bucket trim/append was not locked; concurrent requests from the
+  same user could race past each other, under- or over-counting toward the
+  20/60s limit.
+- **Why wrong (rule 5):** The rate limit must hold under concurrent requests.
+- **Fix:** Wrapped the trim-append-check body in a module-level
+  `threading.Lock`. Verified: 25 concurrent requests from one user → exactly
+  20 succeed (`201`) and exactly 5 get `429 RATE_LIMITED`.
+
+## 20. Room-conflict check and quota check not atomic
+- **File/line:** `app/routers/bookings.py::create_booking` (conflict check,
+  quota check, insert)
+- **Bug:** The conflict check, quota check, and booking insert were three
+  separate, unsynchronized steps with an artificial delay between them.
+  Concurrent requests could each pass the conflict/quota checks before any of
+  them committed, allowing double-booking or quota bypass.
+- **Why wrong (rules 3/4):** No double-booking and the booking quota must
+  both hold under concurrent requests.
+- **Fix:** Added a module-level `_create_lock` and wrapped the
+  conflict-check → quota-check → insert → commit section in it. Verified:
+  5 concurrent requests for the identical room/slot from different users →
+  exactly 1 succeeds, 4 get `409 ROOM_CONFLICT`; 5 concurrent requests from
+  one user against a quota of 3 → exactly 3 succeed, 2 get `409
+  QUOTA_EXCEEDED`.
+
+## 21. Cancel not atomic → possible duplicate refunds
+- **File/line:** `app/routers/bookings.py::cancel_booking`
+- **Bug:** The `status == "cancelled"` guard was checked, then (after an
+  artificial delay) the refund was logged and the status updated, with no
+  locking in between. Two concurrent cancel requests for the same booking
+  could both pass the guard and both write a `RefundLog` row.
+- **Why wrong (rule 6):** A cancelled booking must have exactly one
+  `RefundLog` entry, and this must hold under concurrent cancel requests.
+- **Fix:** Added a module-level `_cancel_lock` wrapping the
+  guard-through-commit section. Also added `db.refresh(booking)` immediately
+  after acquiring the lock — the `booking` object is fetched *before* the
+  lock is taken, so without a refresh a thread that queued behind the lock
+  would still see the stale pre-cancellation status from its own earlier
+  read. Verified: 5 concurrent cancel requests for the same booking →
+  exactly 1 succeeds (`200`), 4 get `409 ALREADY_CANCELLED`, and the booking
+  ends up with exactly one `RefundLog` entry.
+
 ---
 
 ## Additional bugs identified (not yet fixed)
-These are Hard-tier and left for a later pass (concurrency/structural):
+This is Hard-tier and left for a later pass:
 
-- **Concurrency (hard)**: no locking around the reference-code counter, in-memory
-  stats, and rate-limit buckets (lost updates → duplicate reference codes, wrong
-  stats, over-limit requests); conflict/quota checks and refund logging are not
-  atomic under concurrent requests; and `services/notifications.py` acquires
-  `_email_lock`/`_audit_lock` in opposite orders in `notify_created` vs
-  `notify_cancelled`, a lock-ordering **deadlock** that can hang the service
-  (rules 3/4/5/6/7/14/16). Artificial `time.sleep()` calls widen these windows.
+- **Notifications lock-ordering deadlock** (`services/notifications.py`):
+  `notify_created` acquires `_email_lock` then `_audit_lock`;
+  `notify_cancelled` acquires `_audit_lock` then `_email_lock` — the opposite
+  order. A concurrent create + cancel can deadlock and hang the request
+  threads indefinitely (rule 16, "no combination of concurrent valid requests
+  may hang the service").
