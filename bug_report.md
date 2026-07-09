@@ -77,6 +77,17 @@ contract exactly (paths, status codes, error codes, JSON field names).
   window of any size.
 - **Fix:** `if start <= now`.
 
+## 9. Duplicate username silently returned instead of `409 USERNAME_TAKEN`
+- **File/line:** `app/routers/auth.py`, `register` (was L37–43)
+- **Bug:** When a username already existed in the org, the handler returned
+  that existing user's `{user_id, org_id, username, role}` with `201`, without
+  checking the submitted password at all.
+- **Why wrong (rule 15):** A duplicate username within the org must return
+  `409 USERNAME_TAKEN`. The old behavior also leaked another user's
+  `user_id`/`role` to anyone who "registered" with their username, with no
+  password check.
+- **Fix:** `raise AppError(409, "USERNAME_TAKEN", "Username already taken in this organization")`.
+
 ---
 
 ## Additional bugs identified (not yet fixed)

@@ -4,13 +4,12 @@ Full re-scan of `app/` against the business rules in `contest_overview.md` /
 `README.md`. Bugs below are grouped by difficulty tier (matching the contest's
 Easy 3 / Medium 5 / Hard 10 scoring) and each is checked off as solved or not.
 
-**Progress: 8 of 23 identified bugs fixed** (5 Easy, 3 Medium). Everything
-Hard-tier, plus a handful of Medium items and one newly-found Easy item, are
-still open.
+**Progress: 9 of 23 identified bugs fixed** (6 Easy, 3 Medium). Everything
+Hard-tier, plus a handful of Medium items, are still open.
 
 ---
 
-## Easy (5/6 solved)
+## Easy (6/6 solved)
 
 - [x] **Pagination broken three ways** — `app/routers/bookings.py::list_bookings`
   Used `order_by(...desc())`, `offset(page*limit)`, hard-coded `limit(10)`.
@@ -24,12 +23,15 @@ still open.
   Checked `payload["sub"]` against a set of `jti`s (always false). Fixed → check `jti`.
 - [x] **5-minute grace window on past bookings** — `app/routers/bookings.py::create_booking`
   Allowed `start_time` up to 5 minutes in the past. Fixed → strict `start <= now` check.
-- [ ] **Duplicate username silently "succeeds" instead of `409 USERNAME_TAKEN`** — `app/routers/auth.py::register` (~L32–43)
-  When a username already exists in the org, the handler returns that existing
-  user's `{user_id, org_id, username, role}` with `201`, **without checking the
-  password**. Rule 15 requires `409 USERNAME_TAKEN`. This also means anyone can
-  fetch another user's `user_id`/`role` by "registering" with their username —
-  no auth needed. *(Newly found this pass — not yet fixed.)*
+- [x] **Duplicate username silently "succeeded" instead of `409 USERNAME_TAKEN`** — `app/routers/auth.py::register`
+  When a username already existed in the org, the handler returned that
+  existing user's `{user_id, org_id, username, role}` with `201`, **without
+  checking the password**. Rule 15 requires `409 USERNAME_TAKEN`. This also
+  meant anyone could fetch another user's `user_id`/`role` by "registering"
+  with their username — no auth needed. Fixed → `raise AppError(409,
+  "USERNAME_TAKEN", ...)`. Verified: duplicate username (even with wrong
+  password) → 409; same username in a different org still succeeds; normal
+  registration flow unaffected.
 
 ## Medium (3/8 solved)
 
@@ -114,21 +116,24 @@ still open.
 
 ## Verification performed so far
 1. `pytest` — smoke test green (`tests/test_smoke.py`).
-2. End-to-end script against the running app confirmed all 8 solved fixes:
+2. End-to-end script against the running app confirmed all 8 original fixes:
    pagination ordering/sizing, `get_booking` field correctness, 900s token
    lifetime, logout invalidation, back-to-back booking acceptance vs. real
    overlap rejection, 0%/100% refund boundaries, UTC-offset normalization, and
    rejection of past `start_time`.
-3. No response shape / status-code / error-code changes vs the documented API
+3. Targeted script confirmed the duplicate-username fix: duplicate username in
+   the same org (even with a wrong password) → `409 USERNAME_TAKEN`; same
+   username in a different org still succeeds; normal registration/login flow
+   unaffected.
+4. No response shape / status-code / error-code changes vs the documented API
    contract were introduced by any fix.
 
 ## Suggested order for the remaining work
-1. Finish Easy: duplicate-username `409 USERNAME_TAKEN` (single-block fix, high value).
-2. Medium correctness items: min-duration validation, `get_booking` ownership
+1. Medium correctness items: min-duration validation, `get_booking` ownership
    check, export org-scoping — each small, isolated, low risk.
-3. Medium cache-staleness items: invalidate report cache on create, invalidate
+2. Medium cache-staleness items: invalidate report cache on create, invalidate
    availability cache on cancel.
-4. Hard tier, roughly in order of risk/complexity: refund rounding
+3. Hard tier, roughly in order of risk/complexity: refund rounding
    unification, refresh-token single-use, then the concurrency-locking cluster
    (reference codes → stats → rate limiter → conflict/quota checks → cancel),
    and finally the notifications deadlock (fix lock ordering to match in both
