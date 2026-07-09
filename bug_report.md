@@ -259,7 +259,40 @@ contract exactly (paths, status codes, error codes, JSON field names).
   bookings by their owners) all completed within ~5s under a hard 15s join
   timeout — no thread hung — with all 20 requests succeeding.
 
+## 23. Malformed `start_time`/`end_time` crashed with an uncaught exception
+- **File/line:** `app/routers/bookings.py::create_booking` (near L89–90)
+- **Bug:** `parse_input_datetime(...)` calls `datetime.fromisoformat(...)`,
+  which raises `ValueError` on invalid input. The call sites had no
+  try/except, so a malformed datetime string propagated as an unhandled
+  exception instead of a clean error response (a `500` in production).
+- **Why wrong:** The API contract expects `400 INVALID_BOOKING_WINDOW` for
+  invalid booking windows, and rule 16 expects the service to respond
+  cleanly to all requests rather than crash.
+- **Fix:** Wrapped both `parse_input_datetime` calls in
+  `try/except ValueError: raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid datetime")`.
+- **Note:** Found via cross-checking a teammate's independent bug report,
+  then confirmed by reproducing the crash live before fixing.
+
+## 24. Usage-report cache not invalidated on room creation
+- **File/line:** `app/routers/rooms.py::create_room`
+- **Bug:** `create_room` never called `cache.invalidate_report(...)`, so a
+  usage-report response cached before a new room existed kept omitting that
+  room indefinitely.
+- **Why wrong (rule 12):** The usage report must list every room in the org,
+  including rooms with zero bookings, and reflect current state immediately.
+- **Fix:** Added `cache.invalidate_report(admin.org_id)` after the room's
+  commit/refresh.
+- **Note:** Found via cross-checking a teammate's independent bug report,
+  then confirmed live: a usage-report fetched before creating a second room
+  only listed the first room; fetching again immediately after creating the
+  second room included both.
+
 ---
 
-All 23 identified bugs (6 Easy, 8 Medium, 9 Hard) have now been fixed and
-verified. No bugs remain outstanding from this inventory.
+All 25 identified bugs (6 Easy, 10 Medium, 9 Hard) have now been fixed and
+verified. No bugs remain outstanding from this inventory. (Two bugs, #23–24
+above, were found via cross-checking a teammate's independent bug report
+against this one; see `PLAN.md`'s "Cross-check against a peer's independent
+bug report" section for the full comparison, including one edge case a
+teammate flagged but both of us agreed to leave unfixed — a race in
+`/auth/register` on concurrent registration of the same brand-new org name.)
