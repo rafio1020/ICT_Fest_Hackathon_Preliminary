@@ -4,8 +4,8 @@ Full re-scan of `app/` against the business rules in `contest_overview.md` /
 `README.md`. Bugs below are grouped by difficulty tier (matching the contest's
 Easy 3 / Medium 5 / Hard 10 scoring) and each is checked off as solved or not.
 
-**Progress: 14 of 23 identified bugs fixed** (6 Easy, 8 Medium). All Easy and
-Medium items are now solved — only the Hard tier remains.
+**Progress: 16 of 23 identified bugs fixed** (6 Easy, 8 Medium, 2 Hard). All
+Easy and Medium items are solved; Hard tier in progress.
 
 ---
 
@@ -82,19 +82,40 @@ Medium items are now solved — only the Hard tier remains.
   is now unused but left in place — removing it would be an unrelated cleanup,
   not a bug fix.)
 
-## Hard (0/9 solved)
+## Hard (2/9 solved)
 
-- [ ] **Refund rounding is wrong and inconsistent between two code paths** — `app/services/refunds.py::log_refund` vs `app/routers/bookings.py::cancel_booking`
-  `log_refund` truncates (`int(refund_dollars * 100)`, always rounds down);
-  `cancel_booking`'s response uses Python's banker's `round()` (rounds half-to-even).
+- [x] **Refund rounding was wrong and inconsistent between two code paths** — `app/services/refunds.py::log_refund` vs `app/routers/bookings.py::cancel_booking`
+  `log_refund` truncated (`int(refund_dollars * 100)`, always rounded down);
+  `cancel_booking`'s response used Python's banker's `round()` (rounds half-to-even).
   Rule 6 requires "nearest cent, half-cents rounding up" **and** the response
-  amount must equal the stored `RefundLog` amount — currently they can disagree
-  (e.g. `price_cents=999`, 50% → response `500`, ledger `499`). Needs one shared,
-  correctly-rounded (half-up) calculation used by both.
-- [ ] **Refresh tokens are not single-use** — `app/routers/auth.py::refresh`
-  Rotation issues new tokens but never revokes the presented refresh token, so it
-  can be replayed indefinitely. Rule 8 requires reuse → 401. Needs a revocation
-  store for refresh `jti`s (mirroring the access-token one) plus a check.
+  amount must equal the stored `RefundLog` amount — they could disagree (e.g.
+  `price_cents=999`, 50% → response `500`, ledger `499`).
+  Fixed → added `calculate_refund_amount_cents(price_cents, percent)` in
+  `refunds.py` using exact integer math (`divmod(price_cents * percent, 100)`,
+  round up when `remainder * 2 >= 100`); `log_refund` uses it to compute the
+  stored amount, and `cancel_booking` now reads `refund_amount_cents` straight
+  off the `RefundLog` entry `log_refund` returns instead of recomputing it —
+  guaranteeing response and ledger are always identical.
+  Verified: `calculate_refund_amount_cents(1001, 50) == 501` (matches the
+  spec's own example); `calculate_refund_amount_cents(999, 50) == 500`
+  (previously diverged between the two paths); a live cancel with a
+  fractional-cent case (`price_cents=2003`, 50%) returns `refund_amount_cents
+  == 1002` and the `RefundLog` entry has the identical `1002`, with exactly
+  one log entry.
+- [x] **Refresh tokens were not single-use** — `app/routers/auth.py::refresh`
+  Rotation issued new tokens but never revoked the presented refresh token, so
+  it could be replayed indefinitely. Rule 8 requires reuse → 401.
+  Fixed → added a `_revoked_refresh_tokens` jti store in `app/auth.py`
+  (mirroring the existing access-token one), with `revoke_refresh_token()` /
+  `is_refresh_token_revoked()` helpers. The `refresh` endpoint now checks the
+  presented token isn't already revoked (401 if it is), then revokes its jti
+  right before issuing the new access+refresh pair.
+  Verified: first refresh with a token succeeds and returns a working new
+  access token; replaying the same (now-rotated) refresh token → 401; the
+  newly issued refresh token itself works exactly once and its own reuse also
+  → 401 (chained rotation); logout/refresh revocation stores are independent,
+  so an unrelated, still-valid access token from the original login remains
+  usable.
 - [ ] **Reference-code counter race** — `app/services/reference.py::next_reference_code`
   Read-then-sleep-then-increment on a shared dict with no lock; concurrent
   requests can read the same `current` value and emit duplicate
@@ -152,15 +173,12 @@ Medium items are now solved — only the Hard tier remains.
    contract were introduced by any fix.
 
 ## Suggested order for the remaining work
-All Easy and Medium items are solved. Only Hard tier remains, roughly in order
-of risk/complexity:
-1. Refund rounding unification (`services/refunds.py` vs `cancel_booking`) —
-   single shared, correctly-rounded calculation.
-2. Refresh-token single-use (`routers/auth.py::refresh`) — add a refresh-jti
-   revocation store mirroring the access-token one.
-3. Concurrency-locking cluster: reference codes → stats → rate limiter →
+All Easy and Medium items are solved; refund rounding and refresh-token
+single-use (Hard #1–2) are solved. Remaining, roughly in order of
+risk/complexity:
+1. Concurrency-locking cluster: reference codes → stats → rate limiter →
    conflict/quota checks → cancel (duplicate-refund race) — each needs a lock
    or equivalent atomicity guard around its read-modify-write.
-4. Notifications lock-ordering deadlock (`services/notifications.py`) — make
+2. Notifications lock-ordering deadlock (`services/notifications.py`) — make
    `notify_created`/`notify_cancelled` acquire `_email_lock`/`_audit_lock` in
    the same order.

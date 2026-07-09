@@ -140,17 +140,46 @@ contract exactly (paths, status codes, error codes, JSON field names).
 - **Fix:** Changed that branch to call `_fetch_scoped(db, org_id, None, room_id)`
   instead, which applies the existing `Room.org_id == org_id` filter.
 
+## 15. Refund rounding wrong and inconsistent between two code paths
+- **File/line:** `app/services/refunds.py::log_refund` (was L15–17) and
+  `app/routers/bookings.py::cancel_booking` (was L209)
+- **Bug:** `log_refund` truncated (`int(refund_dollars * 100)`, always rounds
+  down); `cancel_booking`'s response used Python's banker's `round()` (rounds
+  half-to-even). The two independent calculations could disagree.
+- **Why wrong (rule 6):** Refund amount must round to the nearest cent with
+  half-cents rounding up, and the response amount must equal the amount
+  stored in the `RefundLog`. Example divergence: `price_cents=999`, 50% →
+  old response `500`, old ledger `499`.
+- **Fix:** Added `calculate_refund_amount_cents(price_cents, percent)` to
+  `refunds.py` using exact integer math: `divmod(price_cents * percent, 100)`,
+  incrementing the quotient when `remainder * 2 >= 100` (half-up). `log_refund`
+  uses it for the stored amount; `cancel_booking` now reads
+  `refund_amount_cents` directly from the `RefundLog` entry `log_refund`
+  returns, instead of recomputing it — so response and ledger can never
+  diverge. Verified against the spec's own example (`50% of 1001 = 501`) and
+  a live cancel with a fractional-cent case.
+
+## 16. Refresh tokens were not single-use
+- **File/line:** `app/routers/auth.py::refresh` (was L76–88), `app/auth.py`
+- **Bug:** Rotation issued a new access+refresh token pair but never revoked
+  the presented refresh token, so it could be replayed indefinitely.
+- **Why wrong (rule 8):** Refresh tokens are single-use — refreshing must
+  invalidate the presented refresh token (reuse → 401).
+- **Fix:** Added `_revoked_refresh_tokens` (a jti store in `app/auth.py`,
+  mirroring the existing access-token `_revoked_tokens`) with
+  `revoke_refresh_token()` / `is_refresh_token_revoked()` helpers. The
+  `refresh` endpoint now rejects an already-used refresh token with 401
+  *before* processing, and revokes the presented token's jti right before
+  returning the new pair. Verified with a chained rotation test: token A → 200
+  (new pair B); replaying A → 401; token B → 200 (new pair C); replaying B →
+  401; an unrelated access token issued at login remains valid throughout
+  (access- and refresh-token revocation are independent).
+
 ---
 
 ## Additional bugs identified (not yet fixed)
 These are Hard-tier and left for a later pass (concurrency/structural):
 
-- **Refund rounding + response↔RefundLog mismatch**: `services/refunds.py`
-  truncates (`int(...)`) and `cancel_booking` uses banker's `round`; rule 6 wants
-  half-cents rounded up and the response amount equal to the stored RefundLog
-  amount.
-- **Refresh tokens not single-use** (`routers/auth.py` refresh): rotation returns
-  new tokens but never invalidates the presented refresh token (rule 8).
 - **Concurrency (hard)**: no locking around the reference-code counter, in-memory
   stats, and rate-limit buckets (lost updates → duplicate reference codes, wrong
   stats, over-limit requests); conflict/quota checks and refund logging are not
